@@ -23,7 +23,9 @@ public sealed class DatabaseService
         if (!Exists)
             throw new FileNotFoundException("找不到题库数据库。", _dbPath);
 
-        _connection = new SqliteConnection($"Data Source={_dbPath};Foreign Keys=True");
+        // 浏览器只查询题库。以只读模式打开后，可直接运行在 Program Files 等
+        // 没有写权限的安装目录中。
+        _connection = new SqliteConnection($"Data Source={_dbPath};Mode=ReadOnly;Foreign Keys=True");
         _connection.Open();
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = "PRAGMA foreign_keys=ON;";

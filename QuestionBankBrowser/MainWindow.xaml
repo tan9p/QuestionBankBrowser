@@ -188,6 +188,18 @@
                                 Padding="10,4"
                                 Click="CopyImageButton_Click"
                                 IsEnabled="False"/>
+                        <Button x:Name="CopyLatexButton"
+                                Content="复制 LaTeX 源码"
+                                Margin="8,0,0,0"
+                                Padding="10,4"
+                                Click="CopyLatexButton_Click"
+                                IsEnabled="False"/>
+                        <Button x:Name="CopyOfficeButton"
+                                Content="复制 Word/PPT 块"
+                                Margin="8,0,0,0"
+                                Padding="10,4"
+                                Click="CopyOfficeButton_Click"
+                                IsEnabled="False"/>
                     </StackPanel>
                 </Border>
 

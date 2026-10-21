@@ -17,6 +17,7 @@ public partial class MainWindow : Window
     private bool _loadingFilters;
     private QuestionItem? _currentQuestion;
     private int _pageSize = 100;
+    private bool _startupStarted;
 
     public MainWindow()
     {
@@ -26,6 +27,12 @@ public partial class MainWindow : Window
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        // WPF may raise Loaded again when the window is reattached to the visual tree.
+        if (_startupStarted)
+            return;
+
+        _startupStarted = true;
+
         try
         {
             string baseDir = AppContext.BaseDirectory;
@@ -85,8 +92,18 @@ public partial class MainWindow : Window
             _db = new DatabaseService(dbPath);
             _db.Open();
 
-            // 初始化 WebView2
-            await QuestionWebView.EnsureCoreWebView2Async();
+            // WebView2 的用户数据目录必须可写。安装目录通常位于 Program Files，
+            // 因此将缓存、Cookie 和其他配置放到当前 Windows 用户的 LocalAppData。
+            string webViewDataDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "QuestionBankBrowser",
+                "WebView2");
+            Directory.CreateDirectory(webViewDataDir);
+
+            CoreWebView2Environment webViewEnvironment =
+                await CoreWebView2Environment.CreateAsync(userDataFolder: webViewDataDir);
+            await QuestionWebView.EnsureCoreWebView2Async(webViewEnvironment);
+
 
             QuestionWebView.CoreWebView2.Settings.IsStatusBarEnabled = false;
             QuestionWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = true;
@@ -226,6 +243,8 @@ public partial class MainWindow : Window
             {
                 _currentQuestion = null;
                 CopyImageButton.IsEnabled = false;
+                CopyLatexButton.IsEnabled = false;
+                CopyOfficeButton.IsEnabled = false;
                 PreviewTitle.Text = "";
                 PreviewMeta.Text = "";
 
@@ -255,6 +274,8 @@ public partial class MainWindow : Window
             $"{item.Year} {item.Source} 第 {item.QuestionNo} 题";
         _currentQuestion = item;
         CopyImageButton.IsEnabled = true;
+        CopyLatexButton.IsEnabled = true;
+        CopyOfficeButton.IsEnabled = true;
 
         PreviewMeta.Text =
             $"{item.Type}    ID: {item.Id}";
@@ -758,6 +779,255 @@ body {
             catch { }
             CopyImageButton.IsEnabled = _currentQuestion != null;
         }
+    }
+
+    private void CopyLatexButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentQuestion == null || _db == null)
+            return;
+
+        try
+        {
+            string source = BuildLatexSource(_currentQuestion, _db.GetChoices(_currentQuestion.Id), _db.GetImages(_currentQuestion.Id));
+            Clipboard.SetText(source, TextDataFormat.UnicodeText);
+            StatusText.Text = "LaTeX 源码已复制。图片使用本机绝对路径，移动题库或分享源码时请同时复制对应图片文件。";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "复制 LaTeX 源码失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+    }
+
+    private async void CopyOfficeButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentQuestion == null || _db == null || QuestionWebView.CoreWebView2 == null)
+            return;
+
+        CopyOfficeButton.IsEnabled = false;
+        try
+        {
+            var item = _currentQuestion;
+            var choices = _db.GetChoices(item.Id);
+            var images = _db.GetImages(item.Id);
+            string plainText = BuildLatexSource(item, choices, images);
+            plainText = Regex.Replace(plainText, @"\\begin\{figure\}.*?\\end\{figure\}", " ", RegexOptions.Singleline);
+            plainText = Regex.Replace(plainText, @"!\[.*?\]\(.*?\)", " ");
+            plainText = Regex.Replace(plainText, @"\s+", " ").Trim();
+            var math = new List<(string Token, string Tex, bool Display, string Source)>();
+            string fragment = BuildOfficeFragment(item, choices, images, math);
+            int sourceFormulaCount = 0;
+            string formulasJson = JsonSerializer.Serialize(math.Select(x => new { tex = x.Tex, display = x.Display }));
+            string mathmlJson;
+            if (math.Count == 0)
+            {
+                mathmlJson = "{\"error\":null,\"results\":[]}";
+            }
+            else
+            {
+                bool mathJaxReady = false;
+                for (int attempt = 0; attempt < 100; attempt++)
+                {
+                    string readyJson = await QuestionWebView.CoreWebView2.ExecuteScriptAsync(
+                        "Boolean(window.MathJax && typeof window.MathJax.tex2mml === 'function')");
+                    if (string.Equals(readyJson, "true", StringComparison.OrdinalIgnoreCase))
+                    {
+                        mathJaxReady = true;
+                        break;
+                    }
+                    await Task.Delay(100);
+                }
+
+                if (!mathJaxReady)
+                    throw new InvalidOperationException("MathJax 尚未加载，无法把公式转换为 Office 公式。请确认网络连接后重试。");
+
+                string mathmlScript = """
+                    (formulas => {
+                      const results = formulas.map(f => {
+                        try { return window.MathJax.tex2mml(f.tex, {display: f.display}); }
+                        catch (_) { return null; }
+                      });
+                      return {error: null, results};
+                    })
+                    """;
+                mathmlJson = await QuestionWebView.CoreWebView2.ExecuteScriptAsync($"{mathmlScript}({formulasJson})");
+            }
+            using (var mathmlDoc = JsonDocument.Parse(mathmlJson))
+            {
+                var root = mathmlDoc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("results", out var results))
+                    throw new InvalidOperationException("公式转换返回了无效结果，无法复制 Office 公式。");
+                if (root.TryGetProperty("error", out var errorElement) && errorElement.ValueKind == JsonValueKind.String)
+                    throw new InvalidOperationException(errorElement.GetString());
+                for (int i = 0; i < math.Count; i++)
+                {
+                    string? mathml = results.ValueKind == JsonValueKind.Array && i < results.GetArrayLength() &&
+                                     results[i].ValueKind == JsonValueKind.String
+                        ? results[i].GetString()
+                        : null;
+                    bool conversionSucceeded = !string.IsNullOrWhiteSpace(mathml) &&
+                        mathml.Contains("<math", StringComparison.OrdinalIgnoreCase) &&
+                        !mathml.Contains("<merror", StringComparison.OrdinalIgnoreCase) &&
+                        !mathml.Contains("misplaced &", StringComparison.OrdinalIgnoreCase);
+                    string replacement;
+                    if (conversionSucceeded)
+                    {
+                        replacement = mathml!;
+                    }
+                    else
+                    {
+                        replacement = $"<code>{HtmlEncode(math[i].Source)}</code>";
+                        sourceFormulaCount++;
+                    }
+                    fragment = fragment.Replace(math[i].Token, replacement, StringComparison.Ordinal);
+                }
+            }
+
+            string html = BuildCfHtml(fragment);
+            var data = new DataObject();
+            data.SetData(DataFormats.Html, html);
+            data.SetData(DataFormats.UnicodeText, plainText);
+            data.SetData(DataFormats.Text, plainText);
+            Clipboard.SetDataObject(data, true);
+            StatusText.Text = sourceFormulaCount == 0
+                ? "可编辑题目块已复制。公式已转换为 Office 公式。"
+                : $"可编辑题目块已复制；{sourceFormulaCount} 个无法转换的公式保留为 LaTeX 源码。";
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(ex.Message, "复制 Word/PPT 块失败", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            CopyOfficeButton.IsEnabled = _currentQuestion != null;
+        }
+    }
+
+    private string BuildLatexSource(QuestionItem item, List<ChoiceItem> choices, List<ImageItem> images)
+    {
+        string heading = $"% {item.Year?.ToString() ?? "年份未知"} {item.Source} 第 {item.QuestionNo} 题";
+        var lines = new List<string> { heading, $"% 题型：{item.Type}", "", item.Content ?? "" };
+        if (choices.Count > 0)
+        {
+            lines.Add("");
+            foreach (var choice in choices)
+                lines.Add($"{choice.Key}. {choice.Content}" + (choice.IsCorrect ? "（正确）" : ""));
+        }
+        if (!string.IsNullOrWhiteSpace(item.Answer))
+        {
+            lines.Add("");
+            lines.Add("答案：" + item.Answer);
+        }
+        if (!string.IsNullOrWhiteSpace(item.Analysis))
+        {
+            lines.Add("");
+            lines.Add("解析：" + item.Analysis);
+        }
+
+        string source = string.Join(Environment.NewLine, lines);
+        string baseDir = AppContext.BaseDirectory;
+        source = Regex.Replace(source, @"!\[(?<alt>.*?)\]\((?<path>.*?)\)", match =>
+        {
+            string markdownPath = System.Net.WebUtility.HtmlDecode(match.Groups["path"].Value).Replace('\\', '/');
+            string alt = match.Groups["alt"].Value;
+            var image = images.FirstOrDefault(candidate =>
+                string.Equals(candidate.FilePath.Replace('\\', '/'), markdownPath, StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(candidate.OriginalName, Path.GetFileName(markdownPath), StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(candidate.AltText, alt, StringComparison.Ordinal));
+            string? path = image == null ? null : ResolveImagePath(baseDir, image.FilePath);
+            if (path == null) return match.Value;
+            string latexPath = EscapeLatexPath(path.Replace('\\', '/'));
+            return $"\\begin{{figure}}[htbp]{Environment.NewLine}\\centering{Environment.NewLine}\\includegraphics[width=\\linewidth]{{{latexPath}}}{Environment.NewLine}\\end{{figure}}";
+        });
+        return source;
+    }
+
+    private static string EscapeLatexPath(string path)
+        => path.Replace("%", "\\%", StringComparison.Ordinal)
+            .Replace("#", "\\#", StringComparison.Ordinal)
+            .Replace("&", "\\&", StringComparison.Ordinal)
+            .Replace("_", "\\_", StringComparison.Ordinal)
+            .Replace("$", "\\$", StringComparison.Ordinal);
+
+    private string BuildOfficeFragment(QuestionItem item, List<ChoiceItem> choices, List<ImageItem> images, List<(string Token, string Tex, bool Display, string Source)> math)
+    {
+        var html = new System.Text.StringBuilder();
+        html.Append("<div style=\"font-family:Microsoft YaHei,Arial,sans-serif;font-size:12pt;line-height:1.6;color:#222\">");
+        html.Append("<span>")
+            .Append(HtmlEncode($"({item.Year?.ToString() ?? "年份未知"}{item.Source}{item.QuestionNo})"))
+            .Append(" </span>");
+        if (!string.IsNullOrWhiteSpace(item.Content))
+            html.Append("<span>").Append(OfficeText(item.Content, images, math)).Append(" </span>");
+        if (choices.Count > 0)
+        {
+            foreach (var choice in choices)
+            {
+                html.Append(" <b>").Append(HtmlEncode(choice.Key)).Append(".</b> ");
+                html.Append(OfficeText(choice.Content, images, math));
+            }
+        }
+        AppendOfficeSection(html, "答案", item.Answer, images, math);
+        AppendOfficeSection(html, "解析", item.Analysis, images, math);
+        html.Append("</div>");
+        return html.ToString();
+    }
+
+    private void AppendOfficeSection(System.Text.StringBuilder html, string label, string? text, List<ImageItem> images, List<(string Token, string Tex, bool Display, string Source)> math)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return;
+        html.Append(" <b>").Append(label).Append("：</b>").Append(OfficeText(text, images, math)).Append(' ');
+    }
+
+    private string OfficeText(string? text, List<ImageItem> images, List<(string Token, string Tex, bool Display, string Source)> math)
+    {
+        string encoded = HtmlEncode(text);
+        encoded = Regex.Replace(encoded, @"!\[(.*?)\]\((.*?)\)", match =>
+        {
+            string markdownPath = System.Net.WebUtility.HtmlDecode(match.Groups[2].Value).Replace('\\', '/');
+            string alt = System.Net.WebUtility.HtmlDecode(match.Groups[1].Value);
+            var image = images.FirstOrDefault(candidate => string.Equals(candidate.FilePath.Replace('\\', '/'), markdownPath, StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(candidate.OriginalName, Path.GetFileName(markdownPath), StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(candidate.AltText, alt, StringComparison.Ordinal));
+            string? file = image == null ? null : ResolveImagePath(AppContext.BaseDirectory, image.FilePath);
+            return file == null ? match.Value : OfficeImage(file, image!.AltText);
+        });
+        foreach (var image in images)
+        {
+            if (string.IsNullOrWhiteSpace(image.OriginalName) || !encoded.Contains(image.OriginalName, StringComparison.OrdinalIgnoreCase)) continue;
+            string? file = ResolveImagePath(AppContext.BaseDirectory, image.FilePath);
+            if (file != null) encoded = encoded.Replace(image.OriginalName, OfficeImage(file, image.AltText), StringComparison.OrdinalIgnoreCase);
+        }
+        encoded = Regex.Replace(encoded, @"\$\$(?<tex>.+?)\$\$|\\{1,2}\[(?<tex>.+?)\\{1,2}\]|\\{1,2}\((?<tex>.+?)\\{1,2}\)|(?<!\\)\$(?!\$)(?<tex>.+?)(?<!\\)\$(?!\$)", match =>
+        {
+            string tex = System.Net.WebUtility.HtmlDecode(match.Groups["tex"].Value);
+            bool display = match.Value.StartsWith("$$", StringComparison.Ordinal) || Regex.IsMatch(match.Value, @"^\\{1,2}\[");
+            string token = $"__QB_MATH_{math.Count}__";
+            math.Add((token, tex, display, System.Net.WebUtility.HtmlDecode(match.Value)));
+            return token;
+        }, RegexOptions.Singleline);
+        return Regex.Replace(encoded, @"\s*\r?\n\s*", " ").Replace("\t", " ");
+    }
+
+    private static string OfficeImage(string path, string? alt)
+    {
+        string extension = Path.GetExtension(path).ToLowerInvariant();
+        string mime = extension switch { ".jpg" or ".jpeg" => "image/jpeg", ".gif" => "image/gif", ".webp" => "image/webp", ".svg" => "image/svg+xml", _ => "image/png" };
+        return $"<img src=\"data:{mime};base64,{Convert.ToBase64String(File.ReadAllBytes(path))}\">";
+    }
+
+    private static string BuildCfHtml(string fragment)
+    {
+        const string startMarker = "<!--StartFragment-->";
+        const string endMarker = "<!--EndFragment-->";
+        string before = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>" + startMarker;
+        string after = endMarker + "</body></html>";
+        string html = before + fragment + after;
+        string header = "Version:0.9\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\nStartFragment:0000000000\r\nEndFragment:0000000000\r\nStartSelection:0000000000\r\nEndSelection:0000000000\r\n";
+        int startHtml = System.Text.Encoding.UTF8.GetByteCount(header);
+        int startFragment = startHtml + System.Text.Encoding.UTF8.GetByteCount(before);
+        int endFragment = startFragment + System.Text.Encoding.UTF8.GetByteCount(fragment);
+        int endHtml = endFragment + System.Text.Encoding.UTF8.GetByteCount(after);
+        header = $"Version:0.9\r\nStartHTML:{startHtml:D10}\r\nEndHTML:{endHtml:D10}\r\nStartFragment:{startFragment:D10}\r\nEndFragment:{endFragment:D10}\r\nStartSelection:{startFragment:D10}\r\nEndSelection:{endFragment:D10}\r\n";
+        return header + html;
     }
 
     private void ClearButton_Click(
