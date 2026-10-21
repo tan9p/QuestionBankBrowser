@@ -313,8 +313,14 @@ public partial class MainWindow : Window
         // 题干
         // ------------------------------------------------------------
 
-        string content =
-            HtmlEncode(item.Content);
+        var previewTables = new List<string>();
+        string contentWithTables = ReplaceHtmlTables(
+            item.Content,
+            rows => RenderPreviewTable(rows, images, baseDir),
+            previewTables);
+        string content = HtmlEncode(contentWithTables);
+        for (int i = 0; i < previewTables.Count; i++)
+            content = content.Replace($"__QB_TABLE_{i}__", previewTables[i], StringComparison.Ordinal);
 
         // Markdown 图片转为本地 file URI
         content =
@@ -481,6 +487,19 @@ summary {
 
 .analysis {
     margin-top: 12px;
+}
+
+table.question-table {
+    border-collapse: collapse;
+    margin: 14px auto;
+    max-width: 100%;
+}
+
+table.question-table td, table.question-table th {
+    border: 1px solid #777;
+    padding: 6px 10px;
+    text-align: center;
+    vertical-align: middle;
 }
 
 img.question-image {
@@ -798,6 +817,197 @@ body {
         }
     }
 
+    private string RenderPreviewTable(List<List<HtmlTableCell>> rows, List<ImageItem> images, string baseDir)
+    {
+        var html = new System.Text.StringBuilder("<table class=\"question-table\"><tbody>");
+        foreach (var row in rows)
+        {
+            html.Append("<tr>");
+            foreach (var cell in row)
+            {
+                string tag = cell.IsHeader ? "th" : "td";
+                html.Append('<').Append(tag);
+                AppendSpanAttribute(html, "rowspan", cell.RowSpan);
+                AppendSpanAttribute(html, "colspan", cell.ColSpan);
+                html.Append('>');
+                string text = CleanHtmlCellText(cell.Content).Replace("\r\n", "\n").Replace("\n", "<br>");
+                html.Append(ConvertMarkdownImages(HtmlEncode(text), images, baseDir));
+                html.Append("</").Append(tag).Append('>');
+            }
+            html.Append("</tr>");
+        }
+        return html.Append("</tbody></table>").ToString();
+    }
+
+    private string ConvertHtmlTablesToLatex(string? text)
+    {
+        var tables = new List<string>();
+        string converted = ReplaceHtmlTables(text, RenderLatexTable, tables);
+        for (int i = 0; i < tables.Count; i++)
+            converted = converted.Replace($"__QB_TABLE_{i}__", tables[i], StringComparison.Ordinal);
+        return converted;
+    }
+
+    private static string RenderLatexTable(List<List<HtmlTableCell>> rows)
+    {
+        if (rows.Count == 0) return "";
+        int columns = GetTableColumnCount(rows);
+        var output = new System.Text.StringBuilder();
+        if (rows.SelectMany(row => row).Any(cell => cell.RowSpan > 1))
+            output.AppendLine("% Requires \\usepackage{multirow}");
+        output.Append("\\begin{tabular}{").Append(string.Concat(Enumerable.Repeat("|c", columns))).Append("|}\n\\hline\n");
+        var occupiedUntil = new int[columns];
+        for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        {
+            var cells = new List<string>();
+            int column = 0;
+            foreach (var cell in rows[rowIndex])
+            {
+                while (column < columns && occupiedUntil[column] > rowIndex)
+                {
+                    cells.Add("");
+                    column++;
+                }
+                if (column >= columns) break;
+
+                string content = EscapeLatexCell(CleanHtmlCellText(cell.Content));
+                int span = Math.Min(cell.ColSpan, columns - column);
+                if (cell.RowSpan > 1)
+                {
+                    content = $"\\multirow{{{cell.RowSpan}}}{{*}}{{{content}}}";
+                    for (int i = 0; i < span; i++) occupiedUntil[column + i] = rowIndex + cell.RowSpan;
+                }
+                if (span > 1)
+                    content = $"\\multicolumn{{{span}}}{{|c|}}{{{content}}}";
+                cells.Add(content);
+                column += span;
+            }
+            while (cells.Count < columns) cells.Add("");
+            output.Append(string.Join(" & ", cells)).Append(" \\\\\n\\hline\n");
+        }
+        output.Append("\\end{tabular}");
+        return output.ToString();
+    }
+
+    private static string EscapeLatexCell(string text)
+    {
+        var output = new System.Text.StringBuilder();
+        var matches = Regex.Matches(text, @"\$\$.*?\$\$|\\{1,2}\[.*?\\{1,2}\]|\\{1,2}\(.*?\\{1,2}\)|(?<!\\)\$(?!\$).*?(?<!\\)\$(?!\$)", RegexOptions.Singleline);
+        int position = 0;
+        foreach (Match match in matches)
+        {
+            output.Append(EscapeLatexPlainText(text[position..match.Index]));
+            output.Append(match.Value);
+            position = match.Index + match.Length;
+        }
+        output.Append(EscapeLatexPlainText(text[position..]));
+        return output.ToString();
+    }
+
+    private static string EscapeLatexPlainText(string text)
+    {
+        var output = new System.Text.StringBuilder();
+        foreach (char ch in text)
+        {
+            output.Append(ch switch
+            {
+                '#' => @"\#", '$' => @"\$", '%' => @"\%", '&' => @"\&",
+                '_' => @"\_", '{' => @"\{", '}' => @"\}",
+                '~' => @"\textasciitilde{}", '^' => @"\textasciicircum{}",
+                '\\' => @"\textbackslash{}", _ => ch.ToString()
+            });
+        }
+        return output.ToString();
+    }
+
+    private string BuildOfficeTable(List<List<HtmlTableCell>> rows, List<ImageItem> images, List<(string Token, string Tex, bool Display, string Source)> math)
+    {
+        var html = new System.Text.StringBuilder("<table border=\"1\" cellpadding=\"4\" cellspacing=\"0\"><tbody>");
+        foreach (var row in rows)
+        {
+            html.Append("<tr>");
+            foreach (var cell in row)
+            {
+                string tag = cell.IsHeader ? "th" : "td";
+                html.Append('<').Append(tag);
+                AppendSpanAttribute(html, "rowspan", cell.RowSpan);
+                AppendSpanAttribute(html, "colspan", cell.ColSpan);
+                html.Append('>').Append(OfficeText(CleanHtmlCellText(cell.Content), images, math));
+                html.Append("</").Append(tag).Append('>');
+            }
+            html.Append("</tr>");
+        }
+        return html.Append("</tbody></table>").ToString();
+    }
+
+    private static string ReplaceHtmlTables(string? text, Func<List<List<HtmlTableCell>>, string> render, List<string> renderedTables)
+    {
+        if (string.IsNullOrEmpty(text)) return text ?? "";
+        return Regex.Replace(text, @"<table\b[^>]*>(.*?)</table\s*>", match =>
+        {
+            var rows = new List<List<HtmlTableCell>>();
+            foreach (Match rowMatch in Regex.Matches(match.Groups[1].Value, @"<tr\b[^>]*>(.*?)</tr\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline))
+            {
+                var cells = new List<HtmlTableCell>();
+                foreach (Match cellMatch in Regex.Matches(rowMatch.Groups[1].Value, @"<(td|th)\b([^>]*)>(.*?)</\1\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline))
+                {
+                    cells.Add(new HtmlTableCell(
+                        cellMatch.Groups[3].Value,
+                        ReadSpan(cellMatch.Groups[2].Value, "rowspan"),
+                        ReadSpan(cellMatch.Groups[2].Value, "colspan"),
+                        string.Equals(cellMatch.Groups[1].Value, "th", StringComparison.OrdinalIgnoreCase)));
+                }
+                if (cells.Count > 0) rows.Add(cells);
+            }
+
+            if (rows.Count == 0) return "";
+            string token = $"__QB_TABLE_{renderedTables.Count}__";
+            renderedTables.Add(render(rows));
+            return token;
+        }, RegexOptions.IgnoreCase | RegexOptions.Singleline);
+    }
+
+    private static int ReadSpan(string attributes, string name)
+    {
+        var match = Regex.Match(attributes, $@"\b{name}\s*=\s*[""']?(\d+)", RegexOptions.IgnoreCase);
+        return match.Success && int.TryParse(match.Groups[1].Value, out int value) ? Math.Clamp(value, 1, 50) : 1;
+    }
+
+    private static void AppendSpanAttribute(System.Text.StringBuilder html, string name, int value)
+    {
+        if (value > 1) html.Append(' ').Append(name).Append("=\"").Append(value).Append('"');
+    }
+
+    private static string CleanHtmlCellText(string? text)
+    {
+        string clean = Regex.Replace(text ?? "", @"<br\s*/?>", " ", RegexOptions.IgnoreCase);
+        clean = Regex.Replace(clean, @"<[^>]*>", " ");
+        return System.Net.WebUtility.HtmlDecode(clean).Trim();
+    }
+
+    private static int GetTableColumnCount(List<List<HtmlTableCell>> rows)
+    {
+        var occupiedUntil = new List<int>();
+        int maxColumns = 0;
+        for (int rowIndex = 0; rowIndex < rows.Count; rowIndex++)
+        {
+            int column = 0;
+            foreach (var cell in rows[rowIndex])
+            {
+                while (column < occupiedUntil.Count && occupiedUntil[column] > rowIndex) column++;
+                int span = cell.ColSpan;
+                while (occupiedUntil.Count < column + span) occupiedUntil.Add(0);
+                if (cell.RowSpan > 1)
+                    for (int i = 0; i < span; i++) occupiedUntil[column + i] = rowIndex + cell.RowSpan;
+                column += span;
+            }
+            maxColumns = Math.Max(maxColumns, column);
+        }
+        return Math.Max(1, maxColumns);
+    }
+
+    private sealed record HtmlTableCell(string Content, int RowSpan, int ColSpan, bool IsHeader);
+
     private async void CopyOfficeButton_Click(object sender, RoutedEventArgs e)
     {
         if (_currentQuestion == null || _db == null || QuestionWebView.CoreWebView2 == null)
@@ -905,22 +1115,22 @@ body {
     private string BuildLatexSource(QuestionItem item, List<ChoiceItem> choices, List<ImageItem> images)
     {
         string heading = $"% {item.Year?.ToString() ?? "年份未知"} {item.Source} 第 {item.QuestionNo} 题";
-        var lines = new List<string> { heading, $"% 题型：{item.Type}", "", item.Content ?? "" };
+        var lines = new List<string> { "% 表格或图片需要 graphicx/multirow 宏包。", heading, $"% 题型：{item.Type}", "", ConvertHtmlTablesToLatex(item.Content) };
         if (choices.Count > 0)
         {
             lines.Add("");
             foreach (var choice in choices)
-                lines.Add($"{choice.Key}. {choice.Content}" + (choice.IsCorrect ? "（正确）" : ""));
+                lines.Add($"{choice.Key}. {ConvertHtmlTablesToLatex(choice.Content)}" + (choice.IsCorrect ? "（正确）" : ""));
         }
         if (!string.IsNullOrWhiteSpace(item.Answer))
         {
             lines.Add("");
-            lines.Add("答案：" + item.Answer);
+            lines.Add("答案：" + ConvertHtmlTablesToLatex(item.Answer));
         }
         if (!string.IsNullOrWhiteSpace(item.Analysis))
         {
             lines.Add("");
-            lines.Add("解析：" + item.Analysis);
+            lines.Add("解析：" + ConvertHtmlTablesToLatex(item.Analysis));
         }
 
         string source = string.Join(Environment.NewLine, lines);
@@ -979,7 +1189,9 @@ body {
 
     private string OfficeText(string? text, List<ImageItem> images, List<(string Token, string Tex, bool Display, string Source)> math)
     {
-        string encoded = HtmlEncode(text);
+        var officeTables = new List<string>();
+        string textWithTables = ReplaceHtmlTables(text, rows => BuildOfficeTable(rows, images, math), officeTables);
+        string encoded = HtmlEncode(textWithTables);
         encoded = Regex.Replace(encoded, @"!\[(.*?)\]\((.*?)\)", match =>
         {
             string markdownPath = System.Net.WebUtility.HtmlDecode(match.Groups[2].Value).Replace('\\', '/');
@@ -1004,7 +1216,10 @@ body {
             math.Add((token, tex, display, System.Net.WebUtility.HtmlDecode(match.Value)));
             return token;
         }, RegexOptions.Singleline);
-        return Regex.Replace(encoded, @"\s*\r?\n\s*", " ").Replace("\t", " ");
+        encoded = Regex.Replace(encoded, @"\s*\r?\n\s*", " ").Replace("\t", " ");
+        for (int i = 0; i < officeTables.Count; i++)
+            encoded = encoded.Replace($"__QB_TABLE_{i}__", officeTables[i], StringComparison.Ordinal);
+        return encoded;
     }
 
     private static string OfficeImage(string path, string? alt)
