@@ -27,7 +27,7 @@ WebView2 缓存和用户配置保存在 `%LOCALAPPDATA%\QuestionBankBrowser\WebV
 2. 使用 Inno Setup 打开 `installer\QuestionBankBrowser.iss` 并编译。安装脚本从仓库中的 Release 输出读取文件，不依赖个人电脑上的绝对路径。
 3. 将 `QuestionBank.db`（以及题目所需图片目录）放在 `QuestionBankBrowser\bin\Release\net9.0-windows\` 后再编译安装包。
 
-安装包版本为 1.0.2。安装时会检查 x64 .NET 9 Desktop Runtime；未安装时，安装程序优先从微软直连地址下载并静默安装，失败后再尝试微软 aka.ms 下载地址。该步骤需要网络连接和管理员权限。
+安装包版本为 1.0.5。安装时会检查 x64 .NET 9 Desktop Runtime；未安装时，安装程序优先从微软直连地址下载并静默安装，失败后再尝试微软 aka.ms 下载地址。该步骤需要网络连接和管理员权限。
 
 ## 功能
 
@@ -45,6 +45,7 @@ WebView2 缓存和用户配置保存在 `%LOCALAPPDATA%\QuestionBankBrowser\WebV
 - 答案/解析显示
 - 自适应窗口
 - 可拖动左右栏宽度
+- 可复制题目为图片、LaTeX源码、Office文档块
 
 ## 注意
 
@@ -54,3 +55,9 @@ WebView2 缓存和用户配置保存在 `%LOCALAPPDATA%\QuestionBankBrowser\WebV
 ## 数据库兼容
 
 本浏览器针对前面提供的 QuestionBankImporter 数据库结构编写。
+
+## 未来增加的功能
+
+- 题目的标签机制
+- 支持自主导入题目
+- 更精致的高考真题版本
